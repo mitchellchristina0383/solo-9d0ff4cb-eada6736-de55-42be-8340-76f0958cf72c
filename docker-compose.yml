@@ -1,0 +1,22 @@
+services:
+  rescue:
+    build: .
+    image: disk-rescue:latest
+    container_name: disk-rescue
+    ports:
+      - "8000:8000"
+    environment:
+      RESCUE_DATA_DIR: /data
+    volumes:
+      - rescue-data:/data
+    restart: unless-stopped
+    healthcheck:
+      # 未建任务时 /api/job 返回 404，故探测首页
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  rescue-data:
+    name: rescue-data

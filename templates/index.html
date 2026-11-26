@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>坏盘救援台</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; padding: 2rem; max-width: 960px; margin-inline: auto; }
+  h1 { font-size: 1.4rem; }
+  section { border: 1px solid #8884; border-radius: 8px; padding: 1rem 1.25rem;
+            margin: 1rem 0; }
+  h2 { font-size: 1.05rem; margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  td, th { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #8883; }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace;
+             font-size: .85rem; }
+  button, .btn { cursor: pointer; padding: .45rem .9rem; border-radius: 6px;
+                 border: 1px solid #888; background: #2d6cdf; color: #fff;
+                 text-decoration: none; font-size: .9rem; display: inline-block; }
+  button.secondary { background: transparent; color: inherit; }
+  button.danger { background: #b33636; }
+  button:disabled { opacity: .5; cursor: default; }
+  .muted { color: #888; font-size: .85rem; }
+  .bar { height: .8rem; background: #8884; border-radius: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: #2d9c5f; }
+  .links a { margin-right: 1rem; }
+  pre { background: #8882; padding: .75rem; border-radius: 6px; overflow: auto;
+        max-height: 16rem; font-size: .8rem; }
+  .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<h1>坏盘救援台</h1>
+<p class="muted">样盘按 {{ sector_size }} 字节分扇区，最大 {{ max_mib }} MiB。
+  读出的扇区陆续上报，读失败跳过；下一轮只补缺失扇区。下载走快照，镜像与缺失清单对应同一进度。</p>
+
+<section>
+  <h2>1. 上传样盘（原始镜像）</h2>
+  <form id="upload-form">
+    <div class="row">
+      <input type="file" name="image" required>
+      <button type="submit">上传并建任务</button>
+    </div>
+  </form>
+</section>
+
+<section>
+  <h2>2. 救援进度</h2>
+  <div id="progress" class="muted">尚未建立任务。</div>
+</section>
+
+<section>
+  <h2>3. 上报读出的扇区</h2>
+  <p class="muted">JSON 载荷，data 为 base64；也可用
+    <code>POST /api/sectors?sector=N</code> 直接发送 512 字节二进制。读失败的扇区不上报即保持缺失。</p>
+  <textarea id="payload" rows="6" placeholder='{"sectors":[{"sector":0,"data":"<base64, 512 字节>"}]}'></textarea>
+  <div class="row" style="margin-top:.5rem">
+    <button id="report-btn">上报</button>
+    <span id="report-result" class="muted"></span>
+  </div>
+</section>
+
+<section>
+  <h2>4. 下载（同一快照，读盘可继续）</h2>
+  <div class="row">
+    <button id="snapshot-btn">生成进度快照</button>
+    <span id="snapshot-info" class="muted"></span>
+  </div>
+  <div id="snapshot-links" class="links" style="margin-top:.75rem"></div>
+  <pre id="missing-preview" hidden></pre>
+</section>
+
+<section>
+  <h2>危险操作</h2>
+  <button class="danger" id="reset-btn">重置并删除当前任务</button>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/job');
+    if (r.status === 404) {
+      $('progress').className = 'muted';
+      $('progress').textContent = '尚未建立任务。';
+      return;
+    }
+    const j = await r.json();
+    const p = j.progress;
+    const pct = p.sector_count ? (100 * p.saved_count / p.sector_count).toFixed(1) : 0;
+    $('progress').className = '';
+    $('progress').innerHTML = `
+      <table>
+        <tr><th>总扇区</th><td>${p.sector_count}</td>
+            <th>样盘大小</th><td>${p.sample_size} 字节</td></tr>
+        <tr><th>已救出</th><td>${p.saved_count}</td>
+            <th>仍缺失</th><td>${p.missing_count}</td></tr>
+        <tr><th>样盘 SHA-256</th><td colspan="3"><code>${p.sample_sha256}</code></td></tr>
+      </table>
+      <div class="bar" style="margin-top:.6rem"><i style="width:${pct}%"></i></div>
+      <p class="muted" style="margin-bottom:0">${pct}%
+        ${p.complete ? '— 全部扇区已救出 ✅' : ''}</p>`;
+  } catch (e) { /* 轮询失败静默 */ }
+}
+setInterval(refresh, 2000);
+refresh();
+
+$('upload-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/api/job', { method: 'POST', body: fd });
+  const j = await r.json();
+  if (!r.ok) { alert('上传失败：' + j.error); return; }
+  e.target.reset();
+  refresh();
+});
+
+$('report-btn').addEventListener('click', async () => {
+  let body;
+  try { body = JSON.parse($('payload').value || '{}'); }
+  catch (err) { $('report-result').textContent = 'JSON 解析失败：' + err; return; }
+  const r = await fetch('/api/sectors', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (!r.ok) { $('report-result').textContent = '失败：' + j.error; return; }
+  $('report-result').textContent =
+    `新写入 ${j.saved_now.length} 个，已存在 ${j.already_saved.length} 个，拒收 ${j.rejected.length} 个`;
+  refresh();
+});
+
+$('snapshot-btn').addEventListener('click', async () => {
+  const r = await fetch('/api/snapshots', { method: 'POST' });
+  const j = await r.json();
+  if (!r.ok) { alert('快照失败：' + j.error); return; }
+  const s = j.snapshot;
+  const id = s.snapshot_id;
+  $('snapshot-info').textContent =
+    `快照 ${id}：已救 ${s.saved.length} / ${s.sector_count}，缺失 ${s.missing.length}`;
+  $('snapshot-links').innerHTML = `
+    <a class="btn" href="/api/snapshots/${id}/image.bin">下载救援镜像（补零）</a>
+    <a class="btn secondary" href="/api/snapshots/${id}/missing.json">下载缺失扇区清单</a>`;
+  const ml = await fetch(`/api/snapshots/${id}/missing.json`);
+  $('missing-preview').hidden = false;
+  $('missing-preview').textContent = JSON.stringify(await ml.json(), null, 2);
+});
+
+$('reset-btn').addEventListener('click', async () => {
+  if (!confirm('确认删除当前任务的全部数据？')) return;
+  await fetch('/api/job', { method: 'DELETE' });
+  $('snapshot-links').innerHTML = '';
+  $('missing-preview').hidden = true;
+  $('snapshot-info').textContent = '';
+  refresh();
+});
+</script>
+</body>
+</html>

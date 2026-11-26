@@ -1,0 +1,9 @@
+.pylibs/
+tests/
+scripts/
+data/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.tmp

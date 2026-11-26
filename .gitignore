@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pylibs/
+data/
+*.tmp
+*.img
+!tests/**/*.img
+.DS_Store
