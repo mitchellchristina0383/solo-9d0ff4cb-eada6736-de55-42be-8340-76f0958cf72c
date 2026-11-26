@@ -199,6 +199,47 @@ class SnapshotApiTests(ApiTestBase):
         self.assertEqual(self.client.get("/api/snapshots/nope/image.bin").status_code, 404)
         self.assertEqual(self.client.get("/api/snapshots/nope/missing.json").status_code, 404)
 
+    def test_list_snapshots_shows_old_and_new(self):
+        sid1 = self.client.post("/api/snapshots").get_json()["snapshot"]["snapshot_id"]
+        for i in (2, 3):
+            block = self.image[i * 512 : (i + 1) * 512]
+            self.report([{"sector": i, "data": base64.b64encode(block).decode()}])
+        sid2 = self.client.post("/api/snapshots").get_json()["snapshot"]["snapshot_id"]
+
+        resp = self.client.get("/api/snapshots")
+        self.assertEqual(resp.status_code, 200)
+        listing = resp.get_json()["snapshots"]
+        self.assertEqual([s["snapshot_id"] for s in listing], [sid1, sid2])
+        self.assertEqual(listing[0]["saved_count"], 4)
+        self.assertEqual(listing[0]["missing_count"], 6)
+        self.assertEqual(listing[1]["saved_count"], 6)
+        self.assertEqual(listing[1]["missing_count"], 4)
+        self.assertEqual(listing[0]["sector_count"], self.sectors)
+
+    def test_old_links_still_work_after_more_progress(self):
+        sid = self.client.post("/api/snapshots").get_json()["snapshot"]["snapshot_id"]
+        # 继续补读并生成更多快照
+        for i in (2, 3, 5, 6, 8, 9):
+            block = self.image[i * 512 : (i + 1) * 512]
+            self.report([{"sector": i, "data": base64.b64encode(block).decode()}])
+        self.client.post("/api/snapshots")
+        # 旧链接仍返回旧进度
+        img = self.client.get(f"/api/snapshots/{sid}/image.bin")
+        self.assertEqual(img.status_code, 200)
+        self.assertEqual(len(img.data), self.sectors * 512)
+        self.assertEqual(img.data[2 * 512 : 3 * 512], b"\x00" * 512)
+        old = self.client.get(f"/api/snapshots/{sid}/missing.json")
+        self.assertEqual(old.status_code, 200)
+        self.assertEqual(old.get_json()["missing"], [2, 3, 5, 6, 8, 9])
+
+    def test_create_response_matches_downloaded_listing(self):
+        created = self.client.post("/api/snapshots").get_json()["snapshot"]
+        sid = created["snapshot_id"]
+        downloaded = self.client.get(f"/api/snapshots/{sid}/missing.json").get_json()
+        self.assertEqual(created["saved"], sorted(created["saved"]))
+        self.assertEqual(created["missing"], downloaded["missing"])
+        self.assertEqual(len(created["saved"]), created["sector_count"] - len(created["missing"]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

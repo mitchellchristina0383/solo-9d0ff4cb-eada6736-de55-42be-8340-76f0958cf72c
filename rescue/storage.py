@@ -8,8 +8,12 @@
   落盘、要么完全不存在；写到一半的临时文件在启动对账时删除，仍算缺失。
 - job.json 是状态缓存，磁盘上的扇区文件才是真相；重启时以文件系统
   为准重建状态，因此中断重启后已完整保存的扇区仍然可用。
-- 快照只记录生成瞬间的 saved 集合与 missing 列表，之后读盘继续进行
-  不影响已生成快照，保证镜像下载与缺失清单对应同一份进度。
+- 已救扇区在单个任务内只增不减，因此维护一份全局的「首次救出顺序」
+  序列 _saved_order。快照只记录生成瞬间该序列的前缀长度 seq 与少量
+  元数据；快照的 saved/missing 在需要时由前缀重建。
+  这样 M 份快照的长期占用是 O(M)，连同 O(N) 的已救序列总占用
+  O(N+M)，不再为每份快照各留一份整盘 saved 与 missing 列表。
+  快照不落额外磁盘；生成后读盘继续进行不影响旧快照。
 """
 
 from __future__ import annotations
@@ -59,6 +63,8 @@ class JobStorage:
         self._lock = threading.RLock()
         self._snapshots: Dict[str, dict] = {}
         self._snapshot_counter = 0
+        # 首次救出顺序（append-only）。快照只保存该序列的前缀长度。
+        self._saved_order: List[int] = []
         self._state: dict = self._load_or_init()
 
     # ------------------------------------------------------------------ #
@@ -93,6 +99,7 @@ class JobStorage:
             state = None
 
         if state is None:
+            self._saved_order = []
             return {
                 "sector_count": 0,
                 "saved": set(),
@@ -101,8 +108,23 @@ class JobStorage:
                 "created_at": None,
             }
 
+        # 重建首次救出序列：沿用 job.json 里的历史顺序，磁盘上额外出现
+        # 的扇区按编号追加。只用于定义快照前缀，集合语义不变。
+        self._saved_order = self._load_saved_order(state)
         self._persist_state(state)
         return state
+
+    def _load_saved_order(self, state: dict) -> List[int]:
+        saved: Set[int] = state["saved"]
+        order: List[int] = []
+        seen: Set[int] = set()
+        for index in state.get("saved_order", []):
+            if index in saved and index not in seen:
+                order.append(index)
+                seen.add(index)
+        for index in sorted(saved - seen):
+            order.append(index)
+        return order
 
     def _scan_saved_sectors(self) -> Set[int]:
         saved: Set[int] = set()
@@ -124,6 +146,8 @@ class JobStorage:
         tmp_path = f"{self.job_path}.{os.getpid()}.{threading.get_ident()}.{TMP_SUFFIX}"
         payload = dict(state)
         payload["saved"] = sorted(state["saved"])  # 落盘时才排序
+        # 首次救出顺序一并落盘，重启后快照前缀语义保持一致。
+        payload["saved_order"] = list(self._saved_order)
         with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
             fh.flush()
@@ -226,6 +250,7 @@ class JobStorage:
             self._state = state
             self._snapshots.clear()
             self._snapshot_counter = 0
+            self._saved_order = []
             self._persist_state(state)
             return self._public_state(state)
 
@@ -270,6 +295,7 @@ class JobStorage:
                 os.close(dir_fd)
 
             self._state["saved"].add(index)
+            self._saved_order.append(index)
             if persist:
                 self._persist_state()
             return True
@@ -318,41 +344,65 @@ class JobStorage:
     # 同进度快照：镜像 + 缺失清单
     # ------------------------------------------------------------------ #
     def create_snapshot(self) -> dict:
-        """生成一份不可变进度快照，镜像与缺失清单共用同一 snapshot_id。"""
+        """生成一份不可变进度快照，镜像与缺失清单共用同一 snapshot_id。
+
+        已救扇区只增不减，因此快照只需固定「首次救出顺序」的前缀长度 seq；
+        之后读盘继续往 _saved_order 尾部追加，旧快照的前缀保持不变。
+        每份快照只占 O(1) 内存、不写额外磁盘，M 份快照合计 O(M)。
+        """
         with self._lock:
             count = self._state["sector_count"]
             if count == 0:
                 raise StorageError("尚无救援任务")
             self._snapshot_counter += 1
             snapshot_id = f"s{self._snapshot_counter:06d}"
-            saved = sorted(self._state["saved"])
-            saved_set = set(saved)
-            missing = [i for i in range(count) if i not in saved_set]
             snapshot = {
                 "snapshot_id": snapshot_id,
                 "sector_count": count,
                 "sector_size": SECTOR_SIZE,
-                "saved": saved,
-                "missing": missing,
+                # 快照时刻已确认落盘的扇区 = 该前缀内的扇区。
+                "seq": len(self._saved_order),
                 "sample_sha256": self._state["sample_sha256"],
                 "created_at": _utc_now(),
             }
             self._snapshots[snapshot_id] = snapshot
-            return dict(snapshot)
+            # 只复制前缀（已救扇区编号），组装视图放到锁外，避免长时间
+            # 持锁阻塞其他请求保存扇区。
+            prefix = self._saved_order[: snapshot["seq"]]
+        return self._snapshot_view(snapshot, prefix)
+
+    @staticmethod
+    def _snapshot_view(snapshot: dict, prefix: List[int]) -> dict:
+        """创建响应用：saved/missing 均按快照时刻计算，不会随后续读盘变化。"""
+        saved = sorted(prefix)
+        saved_set = set(saved)
+        missing = [i for i in range(snapshot["sector_count"]) if i not in saved_set]
+        return {
+            "snapshot_id": snapshot["snapshot_id"],
+            "sector_count": snapshot["sector_count"],
+            "sector_size": SECTOR_SIZE,
+            "saved": saved,
+            "missing": missing,
+            "missing_count": len(missing),
+            "sample_sha256": snapshot["sample_sha256"],
+            "created_at": snapshot["created_at"],
+        }
 
     def open_snapshot_image(self, snapshot_id: str):
         """按快照顺序流式产出救援镜像；缺失位置补零。
 
-        生成器持有快照时的 saved 集合副本，读盘继续进行不影响本流。
+        生成器只持有快照前缀内的扇区编号副本，读盘继续进行不影响本流；
+        组装与逐扇区读取均在锁外进行，不阻塞其他请求保存扇区。
         """
         with self._lock:
             snapshot = self._snapshots.get(snapshot_id)
             if snapshot is None:
                 return None
             count = snapshot["sector_count"]
-            saved_set = set(snapshot["saved"])
+            prefix = self._saved_order[: snapshot["seq"]]
 
         def generate():
+            saved_set = set(prefix)
             zero = b"\x00" * SECTOR_SIZE
             for index in range(count):
                 if index in saved_set:
@@ -368,20 +418,59 @@ class JobStorage:
 
         return generate()
 
+    def list_snapshots(self) -> List[dict]:
+        """已生成快照的概要，按生成先后排序（供救援页核对新旧快照）。
+
+        只返回计数与元数据；整盘 saved/missing 列表仍在各自下载接口按
+        快照前缀即时计算，不在快照记录中保留。
+        """
+        with self._lock:
+            summaries = []
+            for snapshot in self._snapshots.values():
+                # _saved_order 内编号唯一（仅在文件尚不存在时追加，重启时
+                # 去重），故前缀长度即已救数量；无需再构造集合，列表组装
+                # 保持 O(M)。
+                saved_count = snapshot["seq"]
+                total = snapshot["sector_count"]
+                summaries.append(
+                    {
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "sector_count": total,
+                        "sector_size": SECTOR_SIZE,
+                        "saved_count": saved_count,
+                        "missing_count": total - saved_count,
+                        "sample_sha256": snapshot["sample_sha256"],
+                        "created_at": snapshot["created_at"],
+                    }
+                )
+            return summaries
+
     def snapshot_missing_list(self, snapshot_id: str) -> Optional[dict]:
         with self._lock:
             snapshot = self._snapshots.get(snapshot_id)
             if snapshot is None:
                 return None
-            return {
-                "snapshot_id": snapshot["snapshot_id"],
-                "created_at": snapshot["created_at"],
-                "sector_count": snapshot["sector_count"],
-                "sector_size": SECTOR_SIZE,
-                "sample_sha256": snapshot["sample_sha256"],
-                "missing_count": len(snapshot["missing"]),
-                "missing": snapshot["missing"],
-            }
+            prefix = self._saved_order[: snapshot["seq"]]
+        # 锁外组装缺失清单，期间其他请求仍可保存扇区。
+        saved_set = set(prefix)
+        missing = [
+            i for i in range(snapshot["sector_count"]) if i not in saved_set
+        ]
+        return {
+            "snapshot_id": snapshot["snapshot_id"],
+            "created_at": snapshot["created_at"],
+            "sector_count": snapshot["sector_count"],
+            "sector_size": SECTOR_SIZE,
+            "sample_sha256": snapshot["sample_sha256"],
+            "missing_count": len(missing),
+            "missing": missing,
+        }
+
+    def snapshot_sector_count(self, snapshot_id: str) -> Optional[int]:
+        """快照的整盘扇区数（下载镜像时用于设置 Content-Length）。"""
+        with self._lock:
+            snapshot = self._snapshots.get(snapshot_id)
+            return None if snapshot is None else snapshot["sector_count"]
 
     # ------------------------------------------------------------------ #
     def reset(self) -> None:

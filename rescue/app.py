@@ -164,16 +164,20 @@ def create_app(data_dir: str | None = None) -> Flask:
             return _error(404, str(exc))
         return jsonify({"ok": True, "snapshot": snapshot}), 201
 
+    @app.get("/api/snapshots")
+    def list_snapshots():
+        """已生成快照概要（生成先后排序），便于核对新旧快照。"""
+        return jsonify({"ok": True, "snapshots": storage.list_snapshots()})
+
     @app.get("/api/snapshots/<snapshot_id>/image.bin")
     def download_image(snapshot_id: str):
         generator = storage.open_snapshot_image(snapshot_id)
-        if generator is None:
+        sector_count = storage.snapshot_sector_count(snapshot_id)
+        if generator is None or sector_count is None:
             abort(404, description="快照不存在或已过期")
-        state = storage.get_state()
         resp = Response(generator, mimetype="application/octet-stream")
-        resp.headers["Content-Length"] = str(
-            state["sector_count"] * SECTOR_SIZE
-        )
+        # 长度取自快照本身，而不是当前进度；快照生成后进度变化不影响本响应。
+        resp.headers["Content-Length"] = str(sector_count * SECTOR_SIZE)
         resp.headers["X-Snapshot-Id"] = snapshot_id
         resp.headers["Content-Disposition"] = (
             f'attachment; filename="rescue-{snapshot_id}.img"'
